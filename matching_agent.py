@@ -1,8 +1,19 @@
+import logging
 import re
+import sys
+import warnings
 from typing import Optional
+
+# Suppress Python 3.14 compatibility warning emitted during LangChain imports.
+warnings.filterwarnings(
+    "ignore",
+    message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.",
+    category=UserWarning,
+)
 
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
+from langchain_core._api.deprecation import LangChainDeprecationWarning
 
 from agent_tools import (
     CandidateShortlistItem,
@@ -13,6 +24,7 @@ from agent_tools import (
     extract_requirements,
     generate_improvement_suggestions,
     generate_interview_questions,
+    infer_city_from_text,
     search_resumes,
 )
 
@@ -39,6 +51,8 @@ class AgentState(BaseModel):
 
 def infer_intent(user_msg: str, has_jd: bool) -> str:
     msg = user_msg.lower().strip()
+    if any(k in msg for k in ["top", "name", "city", "location", "details"]):
+        return "details"
     if any(k in msg for k in ["compare", " vs ", " versus "]):
         return "compare"
     if msg.startswith("why") or "rank higher" in msg or "why did" in msg:
@@ -108,6 +122,13 @@ def parse_question_target(user_msg: str, shortlist: list[CandidateShortlistItem]
         if c.name.lower() in msg or c.candidate_id.lower() in msg:
             return c
     return shortlist[0] if shortlist else None
+
+
+def parse_top_count(user_msg: str, default: int = 3) -> int:
+    match = re.search(r"top\s+(\d+)", user_msg.lower())
+    if not match:
+        return default
+    return max(1, min(int(match.group(1)), 10))
 
 
 # =============================================================================
@@ -197,6 +218,7 @@ def rank_candidates_node(state: dict) -> dict:
                 fit_score=analysis.fit_score,
                 combined_score=combined,
                 recommendation=recommendation,
+                city=infer_city_from_text(candidate.get("relevant_excerpts", [])),
                 improvement_suggestions=suggestions,
             )
         )
@@ -226,10 +248,7 @@ def generate_report_node(state: dict) -> dict:
             lines.extend([f"- {req}" for req in st.requirements.nice_to_have[:8]])
 
     lines.append("")
-    lines.append(
-        "You can say: 'compare top 3', 'why did X rank higher than Y', "
-        "or 'generate interview questions for <name>'."
-    )
+    lines.append("You can say: 'compare top 3', 'why did X rank higher than Y', ")
 
     return {"last_response": "\n".join(lines)}
 
@@ -276,6 +295,20 @@ def interview_questions_node(state: dict) -> dict:
     return {"last_response": "\n".join(lines)}
 
 
+def candidate_details_node(state: dict) -> dict:
+    st = AgentState.model_validate(state)
+    if not st.shortlist:
+        return {"last_response": "No candidates available yet. Run a search first."}
+
+    count = parse_top_count(st.last_user_message or "", default=3)
+    selected = st.shortlist[:count]
+    lines = [f"Top {len(selected)} candidates:"]
+    for c in selected:
+        city = c.city if c.city else "Not available in resume data"
+        lines.append(f"- {c.name} | City: {city}")
+    return {"last_response": "\n".join(lines)}
+
+
 def fallback_node(state: dict) -> dict:
     return {
         "last_response": (
@@ -309,6 +342,7 @@ def build_graph() -> StateGraph:
     graph.add_node("compare_candidates", compare_candidates_node)
     graph.add_node("explain_ranking", explain_ranking_node)
     graph.add_node("interview_questions", interview_questions_node)
+    graph.add_node("candidate_details", candidate_details_node)
     graph.add_node("fallback", fallback_node)
     graph.add_node("human_feedback", human_feedback_node)
 
@@ -325,6 +359,8 @@ def build_graph() -> StateGraph:
             return "explain_ranking"
         if intent == "questions":
             return "interview_questions"
+        if intent == "details":
+            return "candidate_details"
         return "fallback"
 
     graph.add_conditional_edges(
@@ -335,6 +371,7 @@ def build_graph() -> StateGraph:
             "compare_candidates": "compare_candidates",
             "explain_ranking": "explain_ranking",
             "interview_questions": "interview_questions",
+            "candidate_details": "candidate_details",
             "fallback": "fallback",
         },
     )
@@ -347,6 +384,7 @@ def build_graph() -> StateGraph:
     graph.add_edge("compare_candidates", "human_feedback")
     graph.add_edge("explain_ranking", "human_feedback")
     graph.add_edge("interview_questions", "human_feedback")
+    graph.add_edge("candidate_details", "human_feedback")
     graph.add_edge("fallback", "human_feedback")
 
     graph.add_edge("human_feedback", END)
@@ -361,6 +399,7 @@ def build_graph() -> StateGraph:
 def run_cli() -> None:
     graph = build_graph()
     state = AgentState()
+    configure_cli_output()
     print("Matching Agent CLI. Type 'exit' to quit.")
 
     while True:
@@ -371,12 +410,95 @@ def run_cli() -> None:
             print("Goodbye.")
             break
 
-        state = AgentState.model_validate(
-            graph.invoke({**state.model_dump(), "last_user_message": user_msg})
-        )
+        state = invoke_with_node_trace(graph, state, user_msg)
         if state.last_response:
             print(f"\nAgent:\n{state.last_response}")
 
 
+def run_single_query(query: str) -> None:
+    graph = build_graph()
+    configure_cli_output()
+    state = AgentState()
+    state = invoke_with_node_trace(graph, state, query)
+    if state.last_response:
+        print(f"\nAgent:\n{state.last_response}")
+
+
+def configure_cli_output() -> None:
+    """Keep console UI user-focused by silencing noisy library logs."""
+    logging.getLogger().setLevel(logging.WARNING)
+    for logger_name in [
+        "httpx",
+        "httpcore",
+        "openai",
+        "langchain",
+        "langchain_core",
+        "langsmith",
+        "chromadb",
+    ]:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
+    warnings.filterwarnings(
+        "ignore",
+        message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.",
+        category=UserWarning,
+    )
+
+
+def prettify_node_name(node_name: str) -> str:
+    return node_name.replace("_", " ").title()
+
+
+NODE_STATUS_LABELS: dict[str, str] = {
+    "parse_input": "Understanding your request...",
+    "extract_requirements": "Extracting requirements...",
+    "search_resumes": "Searching resumes...",
+    "rank_candidates": "Reasoning about candidate fit...",
+    "generate_report": "Preparing results...",
+    "compare_candidates": "Comparing candidates...",
+    "explain_ranking": "Explaining ranking decisions...",
+    "interview_questions": "Generating interview questions...",
+    "candidate_details": "Collecting candidate details...",
+    "human_feedback": "Finalizing response...",
+    "fallback": "Clarifying your request...",
+}
+
+
+def show_live_status(message: str, final: bool = False) -> None:
+    line = f"Status: {message}"
+    if final:
+        print(f"\r{line.ljust(90)}")
+    else:
+        print(f"\r{line.ljust(90)}", end="", flush=True)
+
+
+def invoke_with_node_trace(graph: StateGraph, state: AgentState, user_msg: str) -> AgentState:
+    payload = {**state.model_dump(), "last_user_message": user_msg}
+    merged = dict(payload)
+    last_status = ""
+    show_live_status("Thinking...")
+    try:
+        for event in graph.stream(payload, stream_mode="updates"):
+            for node_name, updates in event.items():
+                if node_name.startswith("__"):
+                    continue
+                status = NODE_STATUS_LABELS.get(node_name, f"Working on {prettify_node_name(node_name)}...")
+                if status != last_status:
+                    show_live_status(status)
+                    last_status = status
+                merged.update(updates)
+        show_live_status("Done.", final=True)
+    except Exception:
+        merged["last_response"] = (
+            "I could not complete that request due to incomplete data from one of the analysis steps. "
+            "Please try again, refine the query, or ask for top candidate details."
+        )
+        show_live_status("I hit a processing issue. Returning a safe response.", final=True)
+    return AgentState.model_validate(merged)
+
+
 if __name__ == "__main__":
-    run_cli()
+    if len(sys.argv) > 1:
+        run_single_query(" ".join(sys.argv[1:]))
+    else:
+        run_cli()

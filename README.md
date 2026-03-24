@@ -8,7 +8,7 @@ LangGraph-based matching agent that ranks resumes against a job description, sup
 
 ```bash
 cd "/Users/garvit/Airtribe Assignment/Agentic Profile Mtaching"
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```

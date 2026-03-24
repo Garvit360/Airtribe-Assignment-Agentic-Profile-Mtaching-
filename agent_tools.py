@@ -1,8 +1,9 @@
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
@@ -39,6 +40,7 @@ class CandidateShortlistItem(BaseModel):
     fit_score: int = Field(..., ge=0, le=100)
     combined_score: int = Field(..., ge=0, le=100)
     recommendation: str = Field(..., description="hire | borderline | no-hire")
+    city: Optional[str] = Field(None, description="Best-effort inferred city")
     improvement_suggestions: list[str] = Field(default_factory=list)
 
 
@@ -51,6 +53,38 @@ def _get_llm() -> ChatOpenAI:
     return ChatOpenAI(model=CHAT_MODEL, temperature=0.2)
 
 
+def infer_city_from_text(excerpts: list[str]) -> Optional[str]:
+    patterns = [
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b",
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*,\s*(?:USA|United States)\b",
+    ]
+    for text in excerpts:
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1).strip()
+    return None
+
+
+def _extract_json_text(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    start = min([idx for idx in [text.find("{"), text.find("[")] if idx != -1], default=-1)
+    if start > 0:
+        text = text[start:]
+    return text.strip()
+
+
+def _load_json_payload(raw: str) -> dict:
+    cleaned = _extract_json_text(raw)
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected JSON object payload from model response.")
+    return parsed
+
+
 def extract_requirements(jd: str) -> RequirementSpec:
     llm = _get_llm()
     system = (
@@ -60,7 +94,8 @@ def extract_requirements(jd: str) -> RequirementSpec:
     )
     human = f"Job description:\n{jd}\n\nReturn JSON only."
     response = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)]).content
-    return RequirementSpec.model_validate_json(response)
+    payload = _load_json_payload(response)
+    return RequirementSpec.model_validate(payload)
 
 
 def search_resumes(jd: str, k: int = 10) -> list[dict]:
@@ -86,7 +121,17 @@ def analyze_candidate_fit(jd: str, candidate: dict) -> CandidateAnalysis:
         "Return JSON only."
     )
     response = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)]).content
-    return CandidateAnalysis.model_validate_json(response)
+    try:
+        payload = _load_json_payload(response)
+        return CandidateAnalysis.model_validate(payload)
+    except (ValueError, json.JSONDecodeError, ValidationError):
+        matched = candidate.get("matched_skills", [])
+        return CandidateAnalysis(
+            summary="Fit estimated from semantic match and matched skills.",
+            strengths=[f"Matched skill: {s}" for s in matched[:3]],
+            gaps=[],
+            fit_score=int(candidate.get("match_score", 50)),
+        )
 
 
 def generate_improvement_suggestions(jd: str, candidate_name: str, gaps: list[str]) -> list[str]:
@@ -103,7 +148,7 @@ def generate_improvement_suggestions(jd: str, candidate_name: str, gaps: list[st
         "Provide 2-4 suggestions. Return JSON only."
     )
     response = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)]).content
-    payload = json.loads(response)
+    payload = _load_json_payload(response)
     return [s for s in payload.get("suggestions", []) if isinstance(s, str)]
 
 
@@ -142,7 +187,8 @@ def generate_interview_questions(candidate: CandidateShortlistItem) -> list[str]
         "Provide 5-7 concise questions. Return JSON only."
     )
     response = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)]).content
-    parsed = InterviewQuestions.model_validate_json(response)
+    payload = _load_json_payload(response)
+    parsed = InterviewQuestions.model_validate(payload)
     return parsed.questions
 
 
